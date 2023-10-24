@@ -13,8 +13,11 @@ So far, these are the supported distributions:
 
 ### Pre-requisites
 1- Place the file in the server
+
 2- Open a terminal and navigate to the directory where the script was placed.
+
 3- Give the script execution permissions. You can do so with the following command 
+
 ```
 chmod +x docker-install.sh
 
