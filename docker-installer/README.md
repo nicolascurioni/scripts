@@ -29,7 +29,10 @@ chmod +x docker-install.sh
 
 Options:
   `-s <os>`        Specify the operating system. Supported values: ubuntu, debian, kali, centos, rocky, almalinux.
+  
   `-h`             Show this help message.
+  
   `-y`             Avoid asking for confirmation when installing 
+  
 
 
