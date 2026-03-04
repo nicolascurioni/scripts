@@ -38,7 +38,7 @@ def send_email_notification():
                 })
 
         if not issues:
-            print("Correo: No hay alertas para enviar.")
+            print("Email: No alerts were found")
             return
 
         subject = f"⚠️ ALERT: Wazuh Health Check - {HOSTNAME}"
