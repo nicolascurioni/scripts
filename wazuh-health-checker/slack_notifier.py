@@ -7,7 +7,7 @@ import socket
 import sys
 
 # === CONFIGURATION ===
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/......"
+SLACK_WEBHOOK_URL = "<https://hooks.slack.com/services/......>"
 LOG_PATH = "/var/log/health-checker.json"
 HOSTNAME = socket.gethostname()
 
