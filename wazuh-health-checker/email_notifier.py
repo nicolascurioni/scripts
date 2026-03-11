@@ -17,70 +17,134 @@ DESTINATARIO = "<RECEIVER EMAIL>"
 LOG_PATH = "/var/log/health-checker.json"
 HOSTNAME = socket.gethostname()
 
+def _format_agents_msg_html(details: dict) -> str:
+    """Build an HTML bullet-point agent summary from the agents check payload."""
+    total       = details.get('total', 0)
+    active      = details.get('active', 0)
+    active_pct  = details.get('active_pct', 0.0)
+    disc        = details.get('disconnected', 0)
+    disc_pct    = details.get('disconnected_pct', 0.0)
+    pending     = details.get('pending', 0)
+    pending_pct = details.get('pending_pct', 0.0)
+    never       = details.get('never_connected', 0)
+    never_pct   = details.get('never_connected_pct', 0.0)
+    return (
+        f"• Total: {total}<br>"
+        f"• Active: {active} ({active_pct}%)<br>"
+        f"• Disconnected: {disc} ({disc_pct}%)<br>"
+        f"• Pending: {pending} ({pending_pct}%)<br>"
+        f"• Never connected: {never} ({never_pct}%)"
+    )
+
+
 def send_email_notification():
     try:
+        # 1. Leer última línea del JSON
         with open(LOG_PATH, 'r') as f:
             lines = f.readlines()
-            if not lines: return
+            if not lines:
+                return
             data = json.loads(lines[-1].strip())
 
+        # 2. Filtrar issues (notify: true) + siempre incluir agentes
         all_checks = data.get('checks', {})
         issues = []
+
         for check_id, details in all_checks.items():
-            if details.get('notify') is True:
-                msg = details.get('details') or details.get('issues') or "Revisar logs"
-                if isinstance(msg, list): msg = "<br>".join([f"• {m}" for m in msg])
-                
+            # El check de agentes siempre se incluye si tiene datos
+            if check_id == 'agents' and details.get('total') is not None:
+                msg = _format_agents_msg_html(details)
                 issues.append({
-                    "name": check_id.replace('_', ' ').title(),
-                    "status": details.get('status', 'WARNING').upper(),
+                    "name":   "Agent Summary",
+                    "status": details.get('status', 'OK').upper(),
                     "message": msg
                 })
+                continue
+
+            # El resto: solo si requieren notificación
+            if details.get('notify') is not True:
+                continue
+
+            msg = details.get('details') or details.get('issues') or "Review logs"
+            if isinstance(msg, list):
+                msg = "<br>".join([f"• {m}" for m in msg])
+
+            issues.append({
+                "name":    check_id.replace('_', ' ').title(),
+                "status":  details.get('status', 'WARNING').upper(),
+                "message": msg
+            })
 
         if not issues:
-            print("Email: No alerts were found")
+            print("Email: No alerts to be sent.")
             return
 
+        # 3. Construir el cuerpo del correo en HTML
         subject = f"⚠️ ALERT: Wazuh Health Check - {HOSTNAME}"
-        
+
+        # Primero alerts, luego info (agentes OK al final)
+        alerts  = [i for i in issues if i['status'] != 'OK']
+        info    = [i for i in issues if i['status'] == 'OK']
+        ordered = sorted(alerts, key=lambda x: x['status']) + info
+
         html = f"""
         <html>
         <body style="font-family: Arial, sans-serif; color: #333;">
             <h2 style="color: #d9534f;">Wazuh Alerts report</h2>
             <p>Some issues were detected at server: <strong>{HOSTNAME}</strong></p>
-            <table border="1" cellpadding="10" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+            <table border="1" cellpadding="10" cellspacing="0"
+                   style="border-collapse: collapse; width: 100%;">
                 <tr style="background-color: #f8f9fa;">
                     <th>Component</th>
                     <th>State</th>
                     <th>Details</th>
                 </tr>
         """
-        for issue in issues:
-            color = "#d9534f" if issue['status'] == "ERROR" else "#f0ad4e"
+
+        for issue in ordered:
+            if issue['status'] == 'ERROR':
+                color = "#d9534f"
+            elif issue['status'] == 'WARNING':
+                color = "#f0ad4e"
+            else:
+                color = "#5cb85c"   # verde para OK
+
             html += f"""
                 <tr>
                     <td><strong>{issue['name']}</strong></td>
-                    <td style="color: white; background-color: {color}; text-align: center;">{issue['status']}</td>
+                    <td style="color: white; background-color: {color};
+                               text-align: center;">{issue['status']}</td>
                     <td>{issue['message']}</td>
                 </tr>
             """
-        html += "</table><br><p>Please contact Wazuh Support Team at support@wazuh.com</p></body></html>"
 
+        html += """
+            </table>
+            <br>
+            <p>Please contact Wazuh Support Team at support@wazuh.com</p>
+        </body>
+        </html>
+        """
+
+        # 4. Configurar el objeto del mensaje
         msg = MIMEMultipart()
-        msg['From'] = SMTP_USER
-        msg['To'] = DESTINATARIO
+        msg['From']    = SMTP_USER
+        msg['To']      = DESTINATARIO
         msg['Subject'] = subject
         msg.attach(MIMEText(html, 'html'))
 
+        # 5. Enviar
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()  # Seguridad
+            server.starttls()
             server.login(SMTP_USER, SMTP_PASS)
             server.send_message(msg)
-            
-        print("✅ Email successfully sent.")
+
+        alerts_count = len([i for i in issues if i['status'] != 'OK'])
+        print(f"✅ Email successfully sent. {alerts_count} alert(s) found.")
 
     except Exception as e:
         print(f"❌ Error sending email: {e}")
+
 
 if __name__ == "__main__":
     send_email_notification()
