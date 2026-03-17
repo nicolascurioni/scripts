@@ -5,11 +5,12 @@ import json
 import requests
 import socket
 import sys
-
-# === CONFIGURATION ===
-SLACK_WEBHOOK_URL = "<https://hooks.slack.com/services/......>"
+# === CONFIGURACIÓN ===
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/....../......"
+#N8N_WEBHOOK_URL = "https://tu-instancia-n8n.com/webhook/wazuh-health"
 LOG_PATH = "/var/log/health-checker.json"
 HOSTNAME = socket.gethostname()
+
 
 def _format_agents_msg(details: dict) -> str:
     """Build a bullet-point agent summary from the agents check payload."""
@@ -31,9 +32,17 @@ def _format_agents_msg(details: dict) -> str:
     )
 
 
+def _get_environment_identity(checks: dict) -> tuple[str, str]:
+    """Return manager version and UUID from manager_api check payload."""
+    manager_api = checks.get('manager_api', {})
+    version = manager_api.get('manager_version') or "unknown"
+    uuid = manager_api.get('manager_uuid') or "unknown"
+    return version, uuid
+
+
 def send_notifications():
     try:
-        # 1. Leer solo la última línea del log
+        # 1. Read last log line
         with open(LOG_PATH, 'r') as f:
             lines = f.readlines()
             if not lines:
@@ -41,14 +50,15 @@ def send_notifications():
                 return
             last_line = lines[-1].strip()
             
-        # 2. Parsear el JSON de esa línea
+        # 2. JSON parsing
         data = json.loads(last_line)
         all_checks = data.get('checks', {})
+        manager_version, manager_uuid = _get_environment_identity(all_checks)
         issues = []
 
-        # 3. Analizar los checks
+        # 3. Checks analysis
         for check_id, details in all_checks.items():
-            # El check de agentes siempre se incluye si tiene datos
+            # Agent check always include information
             if check_id == 'agents' and details.get('total') is not None:
                 msg = _format_agents_msg(details)
                 issues.append({
@@ -58,7 +68,7 @@ def send_notifications():
                 })
                 continue
 
-            # El resto: solo si requieren notificación
+
             if details.get('notify') is not True:
                 continue
 
@@ -76,18 +86,28 @@ def send_notifications():
             print("No problems that need attention were found.")
             return
 
-        # 4. Construir el payload para Slack
+        # 4. Slack payload
         slack_payload = {
             "blocks": [
                 {
                     "type": "header",
                     "text": {"type": "plain_text", "text": f"🚨 Wazuh Health Alert: {HOSTNAME}"}
                 },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*Environment version:* `{manager_version}`\n"
+                            f"*Environment UUID:* `{manager_uuid}`"
+                        )
+                    }
+                },
                 {"type": "divider"}
             ]
         }
 
-        # Primero los warnings/errors, luego el resumen de agentes al final
+        # First warnings/errors, then agent summary
         alerts   = [i for i in issues if i['status'] != 'OK']
         info     = [i for i in issues if i['status'] == 'OK']
         ordered  = sorted(alerts, key=lambda x: x['status']) + info
@@ -108,10 +128,10 @@ def send_notifications():
                 }
             })
 
-        # 5. Enviar a Slack
+        # 5. Send to Slack
         resp = requests.post(SLACK_WEBHOOK_URL, json=slack_payload, timeout=10)
 
-        # A n8n (Payload completo para lógica avanzada)
+        # A n8n 
         # requests.post(N8N_WEBHOOK_URL, json={
         #     "hostname": HOSTNAME,
         #     "status": "issues_detected",
