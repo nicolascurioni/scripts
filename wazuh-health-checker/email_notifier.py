@@ -8,14 +8,14 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 # === SMTP CONFIGURATION ===
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = "<EMAIL>"
-SMTP_PASS = "<APP PASSWORD>" 
-DESTINATARIO = "<RECEIVER EMAIL>"
+SMTP_SERVER  = "smtp.gmail.com"
+SMTP_PORT    = 587
+SMTP_USER    = "<SENDER_EMAIL>"
+SMTP_PASS    = "<APP_PASSWORD>"
+DESTINATARIO = "<RECEIPIENT_EMAIL>"
+LOG_PATH     = "/var/log/health-checker.json"
+HOSTNAME     = socket.gethostname()
 
-LOG_PATH = "/var/log/health-checker.json"
-HOSTNAME = socket.gethostname()
 
 def _format_agents_msg_html(details: dict) -> str:
     """Build an HTML bullet-point agent summary from the agents check payload."""
@@ -37,21 +37,30 @@ def _format_agents_msg_html(details: dict) -> str:
     )
 
 
+def _get_environment_identity(checks: dict) -> tuple[str, str]:
+    """Return manager version and UUID from manager_api check payload."""
+    manager_api = checks.get('manager_api', {})
+    version = manager_api.get('manager_version') or "unknown"
+    uuid = manager_api.get('manager_uuid') or "unknown"
+    return version, uuid
+
+
 def send_email_notification():
     try:
-        # 1. Leer última línea del JSON
+        # 1. Read last JSON line
         with open(LOG_PATH, 'r') as f:
             lines = f.readlines()
             if not lines:
                 return
             data = json.loads(lines[-1].strip())
 
-        # 2. Filtrar issues (notify: true) + siempre incluir agentes
+        # 2. Filter issues (notify: true) + always include agents
         all_checks = data.get('checks', {})
+        manager_version, manager_uuid = _get_environment_identity(all_checks)
         issues = []
 
         for check_id, details in all_checks.items():
-            # El check de agentes siempre se incluye si tiene datos
+            # Agent check always includes information 
             if check_id == 'agents' and details.get('total') is not None:
                 msg = _format_agents_msg_html(details)
                 issues.append({
@@ -61,7 +70,7 @@ def send_email_notification():
                 })
                 continue
 
-            # El resto: solo si requieren notificación
+            
             if details.get('notify') is not True:
                 continue
 
@@ -79,10 +88,10 @@ def send_email_notification():
             print("Email: No alerts to be sent.")
             return
 
-        # 3. Construir el cuerpo del correo en HTML
+        # 3. Email body 
         subject = f"⚠️ ALERT: Wazuh Health Check - {HOSTNAME}"
 
-        # Primero alerts, luego info (agentes OK al final)
+        # First alerts, then info (agents OK at the end)
         alerts  = [i for i in issues if i['status'] != 'OK']
         info    = [i for i in issues if i['status'] == 'OK']
         ordered = sorted(alerts, key=lambda x: x['status']) + info
@@ -92,6 +101,10 @@ def send_email_notification():
         <body style="font-family: Arial, sans-serif; color: #333;">
             <h2 style="color: #d9534f;">Wazuh Alerts report</h2>
             <p>Some issues were detected at server: <strong>{HOSTNAME}</strong></p>
+            <p>
+                Environment: <strong>{manager_version}</strong><br>
+                UUID: <strong>{manager_uuid}</strong>
+            </p>
             <table border="1" cellpadding="10" cellspacing="0"
                    style="border-collapse: collapse; width: 100%;">
                 <tr style="background-color: #f8f9fa;">
@@ -107,7 +120,7 @@ def send_email_notification():
             elif issue['status'] == 'WARNING':
                 color = "#f0ad4e"
             else:
-                color = "#5cb85c"   # verde para OK
+                color = "#5cb85c"   #  OK green
 
             html += f"""
                 <tr>
@@ -126,14 +139,14 @@ def send_email_notification():
         </html>
         """
 
-        # 4. Configurar el objeto del mensaje
+        # 4. Configure message
         msg = MIMEMultipart()
         msg['From']    = SMTP_USER
         msg['To']      = DESTINATARIO
         msg['Subject'] = subject
         msg.attach(MIMEText(html, 'html'))
 
-        # 5. Enviar
+        # 5. Send
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASS)
