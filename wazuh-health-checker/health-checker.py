@@ -27,6 +27,7 @@ Checks performed:
    15. Filebeat output connectivity                                    [manager]
    16. Wazuh Manager cluster nodes (via API)            [optional]     [manager]
    17. Wazuh Indexer cluster nodes (_cat/nodes)          [optional]     [indexer]
+    18. Alert volume trend drop (current vs previous window)            [indexer]
 
 Deploy modes (--deploy-mode):
     bare-metal – traditional installation (default)
@@ -36,7 +37,7 @@ Deploy modes (--deploy-mode):
 Node roles (--node-role):
     all       – run every check (default)
     manager   – checks 1, 4, 9, 10, 12, 14, 15, 16
-    indexer   – checks 1, 2, 4, 4b, 5, 6, 7, 8, 11, 13, 17
+    indexer   – checks 1, 2, 4, 4b, 5, 6, 7, 8, 11, 13, 17, 18
     dashboard – checks 1, 3, 4
 
 Usage:
@@ -127,12 +128,6 @@ def _make_skip(node_role: str) -> dict:
 # Container exec abstractions
 # ─────────────────────────────────────────────────────────────────────────────
 def _docker_find_container(image_pattern: str) -> str | None:
-    """
-    Find a running Docker container by image name pattern.
-    Uses 'docker ps' directly — no compose file needed.
-    Returns the container name (e.g. 'single-node-wazuh.manager-1') or None.
-    """
-    # Check cache first
     cached = _docker_container_cache.get(image_pattern)
     if cached:
         return cached
@@ -156,10 +151,6 @@ def _docker_find_container(image_pattern: str) -> str | None:
 
 def _docker_exec(container_name: str, cmd: list[str],
                  timeout: int = 30) -> subprocess.CompletedProcess:
-    """
-    Run a command inside a Docker container by container name.
-    Uses 'docker exec' directly — no compose file needed.
-    """
     full_cmd = ["docker", "exec", container_name] + cmd
     return subprocess.run(full_cmd, capture_output=True, text=True, timeout=timeout)
 
@@ -167,7 +158,6 @@ def _docker_exec(container_name: str, cmd: list[str],
 def _kubectl_exec(pod: str, cmd: list[str], namespace: str,
                   container: str | None = None,
                   timeout: int = 30) -> subprocess.CompletedProcess:
-    """Run a command inside a Kubernetes pod."""
     full_cmd = ["kubectl", "exec", pod, "-n", namespace]
     if container:
         full_cmd += ["-c", container]
@@ -178,12 +168,6 @@ def _kubectl_exec(pod: str, cmd: list[str], namespace: str,
 def _container_exec(deploy_mode: str, target: str, cmd: list[str],
                     namespace: str = K8S_DEFAULT_NAMESPACE,
                     timeout: int = 30) -> subprocess.CompletedProcess:
-    """
-    Unified container exec dispatcher.
-    - deploy_mode='docker':     target = Docker image pattern (auto-discovers container)
-    - deploy_mode='kubernetes': target = pod name
-    - deploy_mode='bare-metal': runs command locally
-    """
     if deploy_mode == "docker":
         container_name = _docker_find_container(target)
         if not container_name:
@@ -203,7 +187,7 @@ LOCAL_CHECKS = {"manager_api", "disk_space", "container_health"}
 INDEXER_CHECKS = {
     "indexer_api", "indexer_disk_space", "shards_per_node", "active_shards",
     "jvm_options", "unassigned_shards", "ilm_policies", "retention_feasibility",
-    "indexer_nodes",
+    "indexer_nodes", "alert_volume_trend",
 }
 MANAGER_CHECKS = {
     "ports", "agents", "cron_rotation", "filebeat_service",
@@ -296,10 +280,6 @@ def _get_manager_token(url: str, user: str, password: str) -> tuple[str | None, 
 # Check 0 – Container / Pod Health
 # ─────────────────────────────────────────────────────────────────────────────
 def check_container_health_docker() -> dict:
-    """
-    Verify all Wazuh Docker containers are running.
-    Uses 'docker ps' directly — no compose file needed.
-    """
     wazuh_images = [DOCKER_IMAGE_MANAGER, DOCKER_IMAGE_INDEXER, DOCKER_IMAGE_DASHBOARD]
     try:
         result = subprocess.run(
@@ -323,14 +303,12 @@ def check_container_health_docker() -> dict:
         return _make_check("error", True,
                            details=f"docker ps failed: {result.stderr.strip()}")
 
-    # Parse tab-separated output from docker ps
     containers: list[dict] = []
     for line in result.stdout.strip().splitlines():
         parts = line.split("\t")
         if len(parts) < 4:
             continue
         name, image, status_text, state = parts[0], parts[1], parts[2], parts[3]
-        # Only include Wazuh containers
         if any(img in image for img in wazuh_images):
             containers.append({
                 "name": name, "image": image,
@@ -364,7 +342,6 @@ def check_container_health_docker() -> dict:
 
 
 def check_container_health_k8s(namespace: str) -> dict:
-    """Verify all Wazuh pods in the K8s namespace are Running and Ready."""
     try:
         result = subprocess.run(
             ["kubectl", "get", "pods", "-n", namespace, "-o", "json"],
@@ -434,6 +411,7 @@ def check_container_health_k8s(namespace: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def check_manager_api(url: str, user: str, password: str) -> dict:
     query_endpoint = f"{url}/?pretty=true"
+    info_endpoint = f"{url}/manager/info"
     try:
         token, err = _get_manager_token(url, user, password)
         if err:
@@ -446,8 +424,32 @@ def check_manager_api(url: str, user: str, password: str) -> dict:
         if resp.status_code == 200:
             data = resp.json()
             version = data.get("data", {}).get("api_version", "unknown")
-            return _make_check("ok", False, http_code=resp.status_code,
-                               api_version=version, url=query_endpoint)
+            result = _make_check("ok", False, http_code=resp.status_code,
+                                 api_version=version, url=query_endpoint)
+
+            info_resp = requests.get(info_endpoint,
+                                     headers={"Authorization": f"Bearer {token}"},
+                                     verify=False, timeout=REQUEST_TIMEOUT)
+            if info_resp.status_code == 200:
+                items = (info_resp.json().get("data", {})
+                         .get("affected_items", []))
+                if items:
+                    item = items[0]
+                    result["manager_version"] = item.get("version", "unknown")
+                    result["manager_uuid"] = item.get("uuid", "unknown")
+                else:
+                    result["status"] = "warning"
+                    result["notify"] = True
+                    result["details"] = "Manager info endpoint returned no affected_items"
+            else:
+                result["status"] = "warning"
+                result["notify"] = True
+                result["details"] = (
+                    f"Manager API is reachable but /manager/info failed with HTTP "
+                    f"{info_resp.status_code}")
+                result["manager_info_url"] = info_endpoint
+
+            return result
         return _make_check("error", True, http_code=resp.status_code,
                            details=f"Unexpected status code: {resp.status_code}",
                            url=query_endpoint)
@@ -457,6 +459,91 @@ def check_manager_api(url: str, user: str, password: str) -> dict:
         return _make_check("error", True, details="Request timed out", url=url)
     except Exception as exc:
         return _make_check("error", True, details=str(exc), url=url)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Check 18 – Alert volume trend (Indexer)
+# ─────────────────────────────────────────────────────────────────────────────
+def check_alert_volume_trend(indexer_url: str, user: str, password: str,
+                             window_days: int, drop_threshold_pct: float) -> dict:
+    endpoint = f"{indexer_url}/wazuh-alerts-*/_count"
+
+    if window_days <= 0:
+        return _make_check("error", True,
+                           details="alerts-trend-days must be > 0",
+                           comparison_window_days=window_days)
+
+    def _count_for_range(gte_expr: str, lt_expr: str) -> tuple[int | None, str | None]:
+        payload = {
+            "query": {
+                "range": {
+                    "@timestamp": {
+                        "gte": gte_expr,
+                        "lt": lt_expr,
+                    }
+                }
+            }
+        }
+        try:
+            resp = requests.post(endpoint, auth=(user, password),
+                                 verify=False, timeout=REQUEST_TIMEOUT,
+                                 json=payload)
+            if resp.status_code != 200:
+                return None, f"HTTP {resp.status_code}"
+            return int(resp.json().get("count", 0)), None
+        except requests.exceptions.ConnectionError as exc:
+            return None, f"Connection refused: {exc}"
+        except requests.exceptions.Timeout:
+            return None, "Request timed out"
+        except Exception as exc:
+            return None, str(exc)
+
+    current_gte = f"now-{window_days}d/d"
+    current_lt = "now/d"
+    previous_gte = f"now-{window_days * 2}d/d"
+    previous_lt = f"now-{window_days}d/d"
+
+    current_count, err_current = _count_for_range(current_gte, current_lt)
+    if err_current:
+        return _make_check("error", True,
+                           details=f"Failed current window count: {err_current}",
+                           url=endpoint)
+
+    previous_count, err_previous = _count_for_range(previous_gte, previous_lt)
+    if err_previous:
+        return _make_check("error", True,
+                           details=f"Failed previous window count: {err_previous}",
+                           url=endpoint)
+
+    if previous_count == 0:
+        return _make_check(
+            "ok", False,
+            comparison_window_days=window_days,
+            drop_threshold_pct=drop_threshold_pct,
+            current_alerts=current_count,
+            previous_alerts=previous_count,
+            drop_pct=None,
+            details="Previous window has zero alerts; drop percentage is not computable.",
+            current_window={"gte": current_gte, "lt": current_lt},
+            previous_window={"gte": previous_gte, "lt": previous_lt},
+            url=endpoint,
+        )
+
+    drop_pct = round(((previous_count - current_count) / previous_count) * 100, 2)
+    notify = drop_pct >= drop_threshold_pct
+    status = "warning" if notify else "ok"
+
+    return _make_check(
+        status, notify,
+        comparison_window_days=window_days,
+        drop_threshold_pct=drop_threshold_pct,
+        current_alerts=current_count,
+        previous_alerts=previous_count,
+        drop_pct=drop_pct,
+        current_window={"gte": current_gte, "lt": current_lt},
+        previous_window={"gte": previous_gte, "lt": previous_lt},
+        url=endpoint,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -654,8 +741,6 @@ def check_shards(indexer_url: str, user: str, password: str,
 # Check 7 – JVM Options (API-based)
 # ─────────────────────────────────────────────────────────────────────────────
 def check_jvm_api(indexer_url: str, user: str, password: str) -> dict:
-    # _nodes (info) gives jvm.mem.heap_init/max_in_bytes
-    # _nodes/stats gives os.mem.total_in_bytes + jvm.mem.heap_used_percent
     endpoint_nodes = f"{indexer_url}/_nodes"
     endpoint_stats = f"{indexer_url}/_nodes/stats"
     try:
@@ -685,11 +770,9 @@ def check_jvm_api(indexer_url: str, user: str, password: str) -> dict:
     for node_id, n_info in nodes_data.items():
         ip = n_info.get("ip", "unknown")
         name = n_info.get("name", "unknown")
-        # JVM heap config from _nodes (info endpoint)
         jvm_mem = n_info.get("jvm", {}).get("mem", {})
         xms = jvm_mem.get("heap_init_in_bytes")
         xmx = jvm_mem.get("heap_max_in_bytes")
-        # OS RAM and JVM runtime stats from _nodes/stats
         n_stats = stats_data.get(node_id, {})
         total_ram = n_stats.get("os", {}).get("mem", {}).get("total_in_bytes")
         heap_used_pct = n_stats.get("jvm", {}).get("mem", {}).get("heap_used_percent")
@@ -802,7 +885,7 @@ def check_agents(url: str, user: str, password: str) -> dict:
             return round(n / total * 100, 1) if total else 0.0
 
         return _make_check(
-            "ok", False, total=total,
+            "ok", True, total=total,
             active=active, active_pct=pct(active),
             disconnected=disconnected, disconnected_pct=pct(disconnected),
             pending=pending, pending_pct=pct(pending),
@@ -867,12 +950,6 @@ def check_ilm_policies(indexer_url: str, user: str, password: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def check_cron_rotation(deploy_mode: str = "bare-metal",
                         namespace: str = K8S_DEFAULT_NAMESPACE) -> dict:
-    """
-    Searches cron locations for log rotation jobs.
-    - bare-metal: reads local /etc/crontab, /etc/cron.d/, …
-    - docker:     docker exec into manager container (auto-discovered)
-    - kubernetes: kubectl exec into wazuh-manager-master-0 pod
-    """
     TARGETS = {
         "alerts":   "/var/ossec/logs/alerts",
         "archives": "/var/ossec/logs/archives",
@@ -904,13 +981,11 @@ def check_cron_rotation(deploy_mode: str = "bare-metal",
                     if os.path.isfile(fpath):
                         all_cron_lines.extend(_scan_file(fpath))
     else:
-        # Docker or Kubernetes: exec into the manager container/pod
         if deploy_mode == "docker":
             target = DOCKER_IMAGE_MANAGER
         else:
             target = K8S_POD_MANAGER_MASTER
 
-        # Collect crontab -l output
         try:
             result = _container_exec(
                 deploy_mode, target, ["crontab", "-l"],
@@ -923,7 +998,6 @@ def check_cron_rotation(deploy_mode: str = "bare-metal",
         except Exception:
             pass
 
-        # Also scan /etc/cron.d/ inside the container
         for cron_dir in ["/etc/cron.d"]:
             try:
                 ls_result = _container_exec(
@@ -1108,11 +1182,6 @@ def check_retention_feasibility(indexer_url, user, password,
 # ─────────────────────────────────────────────────────────────────────────────
 def check_filebeat_service(deploy_mode: str = "bare-metal",
                            namespace: str = K8S_DEFAULT_NAMESPACE) -> dict:
-    """
-    - bare-metal: systemctl is-active filebeat
-    - docker:     pgrep filebeat inside manager container (auto-discovered)
-    - kubernetes: pgrep filebeat inside manager pod
-    """
     if deploy_mode == "bare-metal":
         try:
             result = subprocess.run(["systemctl", "is-active", "filebeat"],
@@ -1132,14 +1201,12 @@ def check_filebeat_service(deploy_mode: str = "bare-metal",
         except Exception as exc:
             return _make_check("error", True, service="filebeat", details=str(exc))
 
-    # Docker or Kubernetes: check if filebeat process is running inside manager
     if deploy_mode == "docker":
         target = DOCKER_IMAGE_MANAGER
     else:
         target = K8S_POD_MANAGER_MASTER
 
     try:
-        # Use pgrep -a (list all matching) to be more flexible than -x (exact)
         result = _container_exec(
             deploy_mode, target, ["pgrep", "-a", "filebeat"],
             namespace=namespace, timeout=15)
@@ -1168,11 +1235,6 @@ def check_filebeat_service(deploy_mode: str = "bare-metal",
 # ─────────────────────────────────────────────────────────────────────────────
 def check_filebeat_output(deploy_mode: str = "bare-metal",
                           namespace: str = K8S_DEFAULT_NAMESPACE) -> dict:
-    """
-    - bare-metal: filebeat test output (local)
-    - docker:     docker exec <manager> filebeat test output (auto-discovered)
-    - kubernetes: kubectl exec wazuh-manager-master-0 -- filebeat test output
-    """
     cmd = ["filebeat", "test", "output"]
 
     if deploy_mode == "bare-metal":
@@ -1223,7 +1285,12 @@ def check_manager_cluster_nodes(
 ) -> dict:
     """
     Uses the Manager API GET /cluster/nodes to verify that all expected
-    node names/IPs report status 'connected'.
+    node names/IPs are present in the cluster response.
+
+    NOTE: The Wazuh API /cluster/nodes response does NOT include a 'status'
+    field per node. A node's presence in the response already implies it is
+    connected (only reachable nodes are returned). Validation is therefore
+    based on presence alone, not on a status field.
     """
     token, err = _get_manager_token(url, user, password)
     if err:
@@ -1248,27 +1315,31 @@ def check_manager_cluster_nodes(
         return _make_check("error", True, http_code=resp.status_code,
                            details=f"HTTP {resp.status_code}", url=endpoint)
 
-    items = resp.json().get("data", {}).get("affected_items", [])
+    data = resp.json()
+
+    # Top-level API error check
+    if data.get("error", 0) != 0:
+        return _make_check("error", True,
+                           details=f"API returned error: {data.get('message', 'unknown')}",
+                           url=endpoint)
+
+    items = data.get("data", {}).get("affected_items", [])
     nodes_found: list[dict] = []
     for n in items:
         nodes_found.append({
-            "name":     n.get("name", ""),
-            "type":     n.get("type", ""),
-            "version":  n.get("version", ""),
-            "ip":       n.get("ip", ""),
-            "status":   n.get("status", ""),
+            "name":    n.get("name", ""),
+            "type":    n.get("type", ""),
+            "version": n.get("version", ""),
+            "ip":      n.get("ip", ""),
         })
 
+    # A node is considered present (and therefore healthy) if it appears in
+    # affected_items. Absence means it did not respond to the cluster query.
     found_ids = {n["ip"] for n in nodes_found} | {n["name"] for n in nodes_found}
     issues: list[str] = []
     for expected in expected_nodes:
-        match = next((n for n in nodes_found
-                      if n["ip"] == expected or n["name"] == expected), None)
-        if match is None:
+        if expected not in found_ids:
             issues.append(f"{expected}: not found in cluster response")
-        elif match["status"].lower() != "connected":
-            issues.append(
-                f"{expected} ({match['name']}): status='{match['status']}' (expected 'connected')")
 
     notify = bool(issues)
     status = "error" if issues else "ok"
@@ -1276,7 +1347,8 @@ def check_manager_cluster_nodes(
                        node_count=len(nodes_found),
                        expected=expected_nodes,
                        nodes=nodes_found,
-                       issues=issues or None, url=endpoint)
+                       issues=issues or None,
+                       url=endpoint)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1333,50 +1405,33 @@ def parse_args() -> argparse.Namespace:
         description="Wazuh environment health checker – supports bare-metal, "
                     "Docker, and Kubernetes deployments."
     )
-    # ── Deploy mode ──────────────────────────────────────────────────────
     parser.add_argument("--deploy-mode",
                         choices=["bare-metal", "docker", "kubernetes"],
-                        default="bare-metal",
-                        help="Deployment type (default: bare-metal)")
-    parser.add_argument("--k8s-namespace", default=K8S_DEFAULT_NAMESPACE,
-                        help=f"Kubernetes namespace (default: {K8S_DEFAULT_NAMESPACE})")
+                        default="bare-metal")
+    parser.add_argument("--k8s-namespace", default=K8S_DEFAULT_NAMESPACE)
     parser.add_argument("--node-role",
                         choices=["all", "manager", "indexer", "dashboard"],
-                        default="all",
-                        help="Node role to tailor checks (default: all)")
-
-    # ── URLs ─────────────────────────────────────────────────────────────
+                        default="all")
     parser.add_argument("--manager-url",   default=DEFAULT_MANAGER_URL)
     parser.add_argument("--indexer-url",   default=DEFAULT_INDEXER_URL)
     parser.add_argument("--dashboard-url", default=DEFAULT_DASHBOARD_URL)
-
-    # ── Credentials and logging ──────────────────────────────────────────
-    parser.add_argument("--secrets-file", default=DEFAULT_SECRETS_FILE,
-                        help="Path to credentials file (KEY=VALUE). "
-                             "Env vars override file values.")
+    parser.add_argument("--secrets-file", default=DEFAULT_SECRETS_FILE)
     parser.add_argument("--log-file", default=DEFAULT_LOG_FILE)
-
-    # ── Thresholds ───────────────────────────────────────────────────────
     parser.add_argument("--disk-path",      default=DEFAULT_DISK_PATH)
-    parser.add_argument("--disk-threshold", type=int, default=DEFAULT_DISK_THRESHOLD,
-                        help="Disk usage %% trigger (default: 75)")
-    parser.add_argument("--shard-threshold", type=int, default=DEFAULT_SHARD_THRESHOLD,
-                        help="Active shards %% of limit trigger (default: 80)")
-
-    # ── Manager checks ───────────────────────────────────────────────────
-    parser.add_argument("--manager-host", default="localhost",
-                        help="Host for port checks (default: localhost)")
-    parser.add_argument("--ports", default="1514,1515",
-                        help="Comma-separated ports to check (default: 1514,1515)")
+    parser.add_argument("--disk-threshold", type=int, default=DEFAULT_DISK_THRESHOLD)
+    parser.add_argument("--shard-threshold", type=int, default=DEFAULT_SHARD_THRESHOLD)
+    parser.add_argument("--manager-host", default="localhost")
+    parser.add_argument("--ports", default="1514,1515")
     parser.add_argument("--retention-ism-days", type=int, default=90)
     parser.add_argument("--retention-alerts-days", type=int, default=365)
-
-    # ── Cluster nodes ────────────────────────────────────────────────────
+    parser.add_argument("--alerts-trend-days", type=int, default=7,
+                        help="Window in days for alert trend comparison")
+    parser.add_argument("--alerts-drop-threshold", type=float, default=20.0,
+                        help="Warn when alert drop percentage is >= this value")
     parser.add_argument("--manager-nodes", default="",
                         help="Comma-separated manager cluster node IPs/names")
     parser.add_argument("--indexer-nodes", default="",
                         help="Comma-separated indexer cluster node IPs")
-
     return parser.parse_args()
 
 
@@ -1398,46 +1453,37 @@ def main() -> None:
 
     checks: dict[str, dict] = {}
 
-    # ── Check 0: Container / Pod Health ───────────────────────────────────
     if mode != "bare-metal" and should_run("container_health", role):
         print("    [0] Container/Pod health…")
         if mode == "docker":
             checks["container_health"] = check_container_health_docker()
         elif mode == "kubernetes":
-            checks["container_health"] = check_container_health_k8s(
-                args.k8s_namespace)
+            checks["container_health"] = check_container_health_k8s(args.k8s_namespace)
 
-    # ── Check 1: Manager API ─────────────────────────────────────────────
     if should_run("manager_api", role):
         print("    [1] Manager API…")
-        checks["manager_api"] = check_manager_api(
-            args.manager_url, mgr_user, mgr_pass)
+        checks["manager_api"] = check_manager_api(args.manager_url, mgr_user, mgr_pass)
     else:
         checks["manager_api"] = _make_skip(role)
 
-    # ── Check 2: Indexer API ─────────────────────────────────────────────
     if should_run("indexer_api", role):
         print("    [2] Indexer API…")
-        checks["indexer_api"] = check_indexer_api(
-            args.indexer_url, idx_user, idx_pass)
+        checks["indexer_api"] = check_indexer_api(args.indexer_url, idx_user, idx_pass)
     else:
         checks["indexer_api"] = _make_skip(role)
 
-    # ── Check 3: Dashboard ───────────────────────────────────────────────
     if should_run("dashboard", role):
         print("    [3] Dashboard…")
         checks["dashboard"] = check_dashboard(args.dashboard_url)
     else:
         checks["dashboard"] = _make_skip(role)
 
-    # ── Check 4: Disk Space ──────────────────────────────────────────────
     if should_run("disk_space", role):
         print("    [4] Disk space…")
         checks["disk_space"] = check_disk_space(args.disk_path, args.disk_threshold)
     else:
         checks["disk_space"] = _make_skip(role)
 
-    # ── Check 4b: Indexer Disk Space ─────────────────────────────────────
     if should_run("indexer_disk_space", role):
         print("    [4b] Indexer disk space (API)…")
         checks["indexer_disk_space"] = check_indexer_disk_space(
@@ -1445,7 +1491,6 @@ def main() -> None:
     else:
         checks["indexer_disk_space"] = _make_skip(role)
 
-    # ── Check 5 & 6: Shards ─────────────────────────────────────────────
     if should_run("shards_per_node", role):
         print("    [5-6] Shards…")
         checks["shards_per_node"], checks["active_shards"] = check_shards(
@@ -1454,15 +1499,12 @@ def main() -> None:
         checks["shards_per_node"] = _make_skip(role)
         checks["active_shards"] = _make_skip(role)
 
-    # ── Check 7: JVM Options (API) ───────────────────────────────────────
     if should_run("jvm_options", role):
         print("    [7] JVM options (API)…")
-        checks["jvm_options"] = check_jvm_api(
-            args.indexer_url, idx_user, idx_pass)
+        checks["jvm_options"] = check_jvm_api(args.indexer_url, idx_user, idx_pass)
     else:
         checks["jvm_options"] = _make_skip(role)
 
-    # ── Check 8: Unassigned Shards ───────────────────────────────────────
     if should_run("unassigned_shards", role):
         print("    [8] Unassigned shards…")
         checks["unassigned_shards"] = check_unassigned_shards(
@@ -1470,7 +1512,6 @@ def main() -> None:
     else:
         checks["unassigned_shards"] = _make_skip(role)
 
-    # ── Check 9: Ports ───────────────────────────────────────────────────
     if should_run("ports", role):
         print("    [9] Ports…")
         ports_to_check = [int(p.strip()) for p in args.ports.split(",") if p.strip()]
@@ -1478,31 +1519,25 @@ def main() -> None:
     else:
         checks["ports"] = _make_skip(role)
 
-    # ── Check 10: Agents ─────────────────────────────────────────────────
     if should_run("agents", role):
         print("    [10] Agent summary…")
         checks["agents"] = check_agents(args.manager_url, mgr_user, mgr_pass)
     else:
         checks["agents"] = _make_skip(role)
 
-    # ── Check 11: ISM Policies ───────────────────────────────────────────
     if should_run("ilm_policies", role):
         print("    [11] ISM policies…")
-        checks["ilm_policies"] = check_ilm_policies(
-            args.indexer_url, idx_user, idx_pass)
+        checks["ilm_policies"] = check_ilm_policies(args.indexer_url, idx_user, idx_pass)
     else:
         checks["ilm_policies"] = _make_skip(role)
 
-    # ── Check 12: Cron Rotation ──────────────────────────────────────────
     if should_run("cron_rotation", role):
         print("    [12] Cron rotation…")
         checks["cron_rotation"] = check_cron_rotation(
-            deploy_mode=mode,
-            namespace=args.k8s_namespace)
+            deploy_mode=mode, namespace=args.k8s_namespace)
     else:
         checks["cron_rotation"] = _make_skip(role)
 
-    # ── Check 13: Retention Feasibility ──────────────────────────────────
     if should_run("retention_feasibility", role):
         print("    [13] Retention feasibility…")
         checks["retention_feasibility"] = check_retention_feasibility(
@@ -1511,25 +1546,20 @@ def main() -> None:
     else:
         checks["retention_feasibility"] = _make_skip(role)
 
-    # ── Check 14: Filebeat Service ───────────────────────────────────────
     if should_run("filebeat_service", role):
         print("    [14] Filebeat service…")
         checks["filebeat_service"] = check_filebeat_service(
-            deploy_mode=mode,
-            namespace=args.k8s_namespace)
+            deploy_mode=mode, namespace=args.k8s_namespace)
     else:
         checks["filebeat_service"] = _make_skip(role)
 
-    # ── Check 15: Filebeat Output ────────────────────────────────────────
     if should_run("filebeat_output", role):
         print("    [15] Filebeat output…")
         checks["filebeat_output"] = check_filebeat_output(
-            deploy_mode=mode,
-            namespace=args.k8s_namespace)
+            deploy_mode=mode, namespace=args.k8s_namespace)
     else:
         checks["filebeat_output"] = _make_skip(role)
 
-    # ── Check 16: Manager Cluster Nodes (optional) ───────────────────────
     manager_nodes = (
         [ip.strip() for ip in args.manager_nodes.split(",") if ip.strip()]
         if args.manager_nodes.strip() else DEFAULT_MANAGER_NODES
@@ -1539,7 +1569,6 @@ def main() -> None:
         checks["manager_cluster_nodes"] = check_manager_cluster_nodes(
             manager_nodes, args.manager_url, mgr_user, mgr_pass)
 
-    # ── Check 17: Indexer Cluster Nodes (optional) ───────────────────────
     indexer_nodes = (
         [ip.strip() for ip in args.indexer_nodes.split(",") if ip.strip()]
         if args.indexer_nodes.strip() else DEFAULT_INDEXER_NODES
@@ -1549,7 +1578,18 @@ def main() -> None:
         checks["indexer_nodes"] = check_indexer_nodes(
             indexer_nodes, idx_user, idx_pass, args.indexer_url)
 
-    # ── Top-level result ─────────────────────────────────────────────────
+    if should_run("alert_volume_trend", role):
+        print("    [18] Alert volume trend…")
+        checks["alert_volume_trend"] = check_alert_volume_trend(
+            args.indexer_url,
+            idx_user,
+            idx_pass,
+            args.alerts_trend_days,
+            args.alerts_drop_threshold,
+        )
+    else:
+        checks["alert_volume_trend"] = _make_skip(role)
+
     global_notify = any(
         c.get("notify", False) for c in checks.values()
         if c.get("status") != "skipped"
@@ -1563,7 +1603,6 @@ def main() -> None:
         "notify":      global_notify,
     }
 
-    # ── Write to log ─────────────────────────────────────────────────────
     log_dir = os.path.dirname(args.log_file)
     if log_dir and not os.path.isdir(log_dir):
         try:
@@ -1610,6 +1649,7 @@ def main() -> None:
         labels["manager_cluster_nodes"] = "Manager Cluster Nodes"
     if "indexer_nodes" in checks:
         labels["indexer_nodes"] = "Indexer Nodes"
+    labels["alert_volume_trend"] = "Alert Volume Trend"
 
     def _reason(check: dict) -> list[str]:
         """Extract human-readable reason lines from a check result."""
@@ -1641,17 +1681,24 @@ def main() -> None:
                 f"Disconnected: {check['disconnected']} ({check['disconnected_pct']}%)  "
                 f"Pending: {check['pending']} ({check['pending_pct']}%)  "
                 f"Never connected: {check['never_connected']} ({check['never_connected_pct']}%)")
+        if check.get("manager_version") is not None or check.get("manager_uuid") is not None:
+            lines.append(
+                f"Manager version: {check.get('manager_version', 'unknown')} | "
+                f"UUID: {check.get('manager_uuid', 'unknown')}")
+        if check.get("current_alerts") is not None and check.get("previous_alerts") is not None:
+            drop_val = check.get("drop_pct")
+            drop_str = f"{drop_val}%" if drop_val is not None else "n/a"
+            lines.append(
+                f"Current {check.get('comparison_window_days')}d: {check['current_alerts']} | "
+                f"Previous {check.get('comparison_window_days')}d: {check['previous_alerts']} | "
+                f"Drop: {drop_str} (threshold: {check.get('drop_threshold_pct')}%)")
         if check.get("policies") is not None:
             for p in check["policies"]:
                 delete_age = p.get("delete_min_age") or "no delete phase"
                 lines.append(
                     f"{p['name']}: states={p.get('states', [])}, delete_after={delete_age}")
-        if check.get("nodes") and check.get("status") != "ok":
-            for n in check["nodes"]:
-                ip = n.get("ip") or n.get("address", "?")
-                name = n.get("name", "")
-                status_str = n.get("status") or n.get("master", "")
-                lines.append(f"  {ip} ({name}): {status_str}")
+        # NOTE: removed the redundant `nodes` iteration block that was
+        # duplicating lines already captured by the `issues` loop above.
         for target in check.get("missing_rotation_for") or []:
             lines.append(f"Missing cron for /var/ossec/logs/{target}/")
         for a in check.get("retention_analyses") or []:
@@ -1673,7 +1720,6 @@ def main() -> None:
                 lines.append(
                     f"[{feasible}] {label} / {days}d: needs {proj_disk} GB "
                     f"(have {tot_disk} GB), {proj_shrd} shards (limit {shrd_lim})")
-        # Container/pod info
         for c in check.get("containers") or []:
             if c.get("state", "").lower() != "running":
                 lines.append(f"  {c['service']}: {c['state']}")
@@ -1693,6 +1739,21 @@ def main() -> None:
         if check.get("notify"):
             for reason in _reason(check):
                 print(f"         └─ {reason}")
+        elif key == "manager_api":
+            if check.get("manager_version") is not None or check.get("manager_uuid") is not None:
+                print(
+                    "         └─ "
+                    f"Manager version: {check.get('manager_version', 'unknown')} | "
+                    f"UUID: {check.get('manager_uuid', 'unknown')}")
+        elif key == "alert_volume_trend":
+            if check.get("current_alerts") is not None and check.get("previous_alerts") is not None:
+                drop_val = check.get("drop_pct")
+                drop_str = f"{drop_val}%" if drop_val is not None else "n/a"
+                print(
+                    "         └─ "
+                    f"Current {check.get('comparison_window_days')}d: {check['current_alerts']} | "
+                    f"Previous {check.get('comparison_window_days')}d: {check['previous_alerts']} | "
+                    f"Drop: {drop_str} (threshold: {check.get('drop_threshold_pct')}%)")
 
     if global_notify:
         print("\n  ⚠  One or more checks require attention (notify=true in log).")
